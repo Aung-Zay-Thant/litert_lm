@@ -80,8 +80,10 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
       event[@"type"] = @"error";
       event[@"code"] = @"native_failure";
       event[@"message"] = errorString;
+      ctx->box->activeRequestId = nil;
     } else if (isFinal) {
       event[@"type"] = @"done";
+      ctx->box->activeRequestId = nil;
     } else {
       NSString *plainText = nil;
       if (chunkString.length > 0) {
@@ -92,7 +94,6 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
         event[@"text"] = plainText;
       }
     }
-    ctx->box->activeRequestId = nil;
     ctx->block(event);
     if (isFinal || errorString.length > 0) {
       delete ctx;
@@ -237,49 +238,62 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   }
 
   box->activeRequestId = requestId;
-  GemmaStreamEventBlock eventBlock = [onEvent copy];
-  NSString *requestIdCopy = [requestId copy];
-  NSString *messageJSONCopy = [messageJSON copy];
+  StreamContext *ctx = new StreamContext{[onEvent copy], self, box, [requestId copy]};
+  int result = _runtime.conversationSendMessageStream(
+      box->conversation,
+      messageJSON.UTF8String,
+      nullptr,
+      streamCallbackTrampoline,
+      ctx);
 
-  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-    LiteRtLmJsonResponse *response = _runtime.conversationSendMessage(
+  if (result != 0) {
+    box->activeRequestId = nil;
+    delete ctx;
+
+    GemmaStreamEventBlock eventBlock = [onEvent copy];
+    NSString *requestIdCopy = [requestId copy];
+    NSString *messageJSONCopy = [messageJSON copy];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      LiteRtLmJsonResponse *response = _runtime.conversationSendMessage(
         box->conversation,
         messageJSONCopy.UTF8String,
         nullptr);
-    dispatch_async(dispatch_get_main_queue(), ^{
-      box->activeRequestId = nil;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        box->activeRequestId = nil;
 
-    if (response == nullptr) {
+        if (response == nullptr) {
+          eventBlock(@{
+            @"requestId": requestIdCopy,
+            @"type": @"error",
+            @"code": @"native_failure",
+            @"message": [NSString stringWithFormat:@"Failed to start streaming (code %d), and blocking fallback also failed.", result],
+          });
+          return;
+        }
+
+        const char *responseCString = _runtime.jsonResponseGetString(response);
+        NSString *responseJSONString = responseCString == nullptr ? nil : [NSString stringWithUTF8String:responseCString];
+        _runtime.jsonResponseDelete(response);
+
+        NSString *plainText = responseJSONString.length > 0
+            ? [self extractTextFromResponseJSONString:responseJSONString]
+            : @"";
+
+        if (plainText.length > 0) {
+          eventBlock(@{
+            @"requestId": requestIdCopy,
+            @"type": @"chunk",
+            @"text": plainText,
+          });
+        }
         eventBlock(@{
           @"requestId": requestIdCopy,
-          @"type": @"error",
-          @"code": @"native_failure",
-          @"message": @"Generation failed.",
+          @"type": @"done",
         });
-        return;
-      }
-
-      const char *responseCString = _runtime.jsonResponseGetString(response);
-      NSString *responseJSONString = responseCString == nullptr ? nil : [NSString stringWithUTF8String:responseCString];
-      _runtime.jsonResponseDelete(response);
-
-      NSString *plainText = responseJSONString.length > 0
-          ? [self extractTextFromResponseJSONString:responseJSONString]
-          : @"";
-
-      if (plainText.length > 0) {
-        eventBlock(@{
-          @"requestId": requestIdCopy,
-          @"type": @"chunk",
-          @"text": plainText,
-        });
-      }
-      eventBlock(@{
-        @"requestId": requestIdCopy,
-        @"type": @"done",
       });
     });
-  });
+  }
 
   return YES;
 }
