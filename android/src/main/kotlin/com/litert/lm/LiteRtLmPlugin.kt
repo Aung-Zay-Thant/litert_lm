@@ -3,12 +3,14 @@ package com.litert.lm
 import android.content.Context
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
+import com.google.ai.edge.litertlm.SamplerConfig
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -28,6 +30,7 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
     private var conversation: Conversation? = null
     private var currentModelPath: String? = null
     private var eventSink: EventChannel.EventSink? = null
+    private var benchmarkEnabled = false
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -50,18 +53,25 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
         engine = null
     }
 
-    // -- MethodChannel handler --
-
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "prepareModel" -> handlePrepareModel(call, result)
             "generateTextStream" -> handleGenerateStream(call, result)
             "cancelGeneration" -> handleCancel(result)
-            "resetConversation" -> handleReset(call, result)
+            "resetConversation" -> handleReset(result)
+            "getBenchmarkInfo" -> handleGetBenchmark(result)
             else -> result.notImplemented()
         }
     }
 
+    private fun parseBackend(name: String?): Backend {
+        return when (name) {
+            "gpu" -> Backend.GPU()
+            else -> Backend.CPU()
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
     private fun handlePrepareModel(call: MethodCall, result: MethodChannel.Result) {
         val modelPath = call.argument<String>("modelPath")
         if (modelPath.isNullOrEmpty()) {
@@ -69,37 +79,64 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
             return
         }
 
-        // Skip if same model already loaded
         if (engine != null && currentModelPath == modelPath) {
             result.success(null)
             return
         }
 
-        val systemPrompt = call.argument<String>("systemPrompt")
+        val engineCfg = call.argument<Map<String, Any>>("engineConfig") ?: emptyMap()
+        val convCfg = call.argument<Map<String, Any>>("conversationConfig") ?: emptyMap()
 
         scope.launch {
             try {
-                // Clean up previous engine
                 conversation?.close()
                 engine?.close()
 
+                // Engine config
+                val backend = parseBackend(engineCfg["backend"] as? String)
+                val visionBackendStr = engineCfg["visionBackend"] as? String
+                val audioBackendStr = engineCfg["audioBackend"] as? String
+                val maxNumTokens = (engineCfg["maxNumTokens"] as? Number)?.toInt() ?: 4096
+                benchmarkEnabled = engineCfg["enableBenchmark"] as? Boolean ?: false
+
                 val config = EngineConfig(
                     modelPath = modelPath,
-                    backend = Backend.CPU(),
-                    visionBackend = Backend.CPU(),
-                    maxNumTokens = 4096,
+                    backend = backend,
+                    visionBackend = if (visionBackendStr != null) parseBackend(visionBackendStr) else null,
+                    audioBackend = if (audioBackendStr != null) parseBackend(audioBackendStr) else null,
+                    maxNumTokens = maxNumTokens,
                     cacheDir = context.cacheDir.path,
                 )
                 val newEngine = Engine(config)
                 newEngine.initialize()
 
-                val convConfig = if (systemPrompt != null) {
-                    ConversationConfig(
-                        systemInstruction = Contents.of(systemPrompt),
+                // Conversation config
+                val systemPrompt = convCfg["systemPrompt"] as? String
+                val samplerMap = convCfg["sampler"] as? Map<String, Any>
+                val maxOutputTokens = (convCfg["maxOutputTokens"] as? Number)?.toInt()
+                val initialMessages = convCfg["initialMessages"] as? List<Map<String, String>>
+
+                val samplerConfig = if (samplerMap != null) {
+                    SamplerConfig(
+                        topK = (samplerMap["topK"] as? Number)?.toInt() ?: 40,
+                        topP = (samplerMap["topP"] as? Number)?.toFloat() ?: 0.95f,
+                        temperature = (samplerMap["temperature"] as? Number)?.toFloat() ?: 0.8f,
                     )
-                } else {
-                    ConversationConfig()
-                }
+                } else null
+
+                val messages = initialMessages?.map { msg ->
+                    when (msg["role"]) {
+                        "user" -> Message.user(msg["content"] ?: "")
+                        "model" -> Message.model(msg["content"] ?: "")
+                        else -> Message.user(msg["content"] ?: "")
+                    }
+                } ?: emptyList()
+
+                val convConfig = ConversationConfig(
+                    systemInstruction = if (systemPrompt != null) Contents.of(systemPrompt) else null,
+                    samplerConfig = samplerConfig,
+                    initialMessages = messages,
+                )
 
                 engine = newEngine
                 conversation = newEngine.createConversation(convConfig)
@@ -135,12 +172,8 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
 
         val imagePath = call.argument<String>("imagePath")
 
-        // Build message content
         val contents = if (imagePath != null) {
-            Contents.of(
-                com.google.ai.edge.litertlm.Content.Text(prompt),
-                com.google.ai.edge.litertlm.Content.Image(imagePath),
-            )
+            Contents.of(Content.Text(prompt), Content.Image(imagePath))
         } else {
             Contents.of(prompt)
         }
@@ -161,7 +194,6 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
 
                 override fun onError(throwable: Throwable) {
                     if (throwable is java.util.concurrent.CancellationException) {
-                        // User cancelled — just end the stream
                         scope.launch(Dispatchers.Main) { sink.endOfStream() }
                     } else {
                         scope.launch(Dispatchers.Main) {
@@ -180,9 +212,8 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
         result.success(null)
     }
 
-    private fun handleReset(call: MethodCall, result: MethodChannel.Result) {
-        val eng = engine
-        if (eng == null) {
+    private fun handleReset(result: MethodChannel.Result) {
+        val eng = engine ?: run {
             result.success(null)
             return
         }
@@ -200,7 +231,12 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
         }
     }
 
-    // -- EventChannel handler --
+    private fun handleGetBenchmark(result: MethodChannel.Result) {
+        // TODO: Expose benchmark info from Kotlin SDK when API is available
+        result.success(null)
+    }
+
+    // -- EventChannel --
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         eventSink = events

@@ -8,16 +8,10 @@ public class LiteRtLmPlugin: NSObject, FlutterPlugin {
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = LiteRtLmPlugin()
 
-    let channel = FlutterMethodChannel(
-      name: "litert_lm/method",
-      binaryMessenger: registrar.messenger()
-    )
+    let channel = FlutterMethodChannel(name: "litert_lm/method", binaryMessenger: registrar.messenger())
     registrar.addMethodCallDelegate(instance, channel: channel)
 
-    let eventChannel = FlutterEventChannel(
-      name: "litert_lm/stream",
-      binaryMessenger: registrar.messenger()
-    )
+    let eventChannel = FlutterEventChannel(name: "litert_lm/stream", binaryMessenger: registrar.messenger())
     eventChannel.setStreamHandler(instance)
   }
 
@@ -32,9 +26,10 @@ public class LiteRtLmPlugin: NSObject, FlutterPlugin {
         result(FlutterError(code: "bad_args", message: "modelPath is required.", details: nil))
         return
       }
-      let systemPrompt = args["systemPrompt"] as? String
+      let engineConfig = args["engineConfig"] as? [String: Any]
+      let conversationConfig = args["conversationConfig"] as? [String: Any]
       do {
-        try bridge.prepareModel(atPath: path, systemPrompt: systemPrompt, toolsJSON: nil)
+        try bridge.prepareModel(atPath: path, engineConfig: engineConfig, conversationConfig: conversationConfig)
         result(nil)
       } catch {
         result(FlutterError(code: "prepare_failed", message: error.localizedDescription, details: nil))
@@ -78,6 +73,9 @@ public class LiteRtLmPlugin: NSObject, FlutterPlugin {
     case "resetConversation":
       bridge.resetConversation()
       result(nil)
+
+    case "getBenchmarkInfo":
+      result(bridge.getBenchmarkInfo())
 
     default:
       result(FlutterMethodNotImplemented)
