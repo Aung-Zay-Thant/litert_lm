@@ -13,3 +13,4 @@ export 'src/model/lm_message.dart';
 export 'src/model/lm_role.dart';
 export 'src/model/lm_sampler_config.dart';
 export 'src/model/lm_session_config.dart';
+export 'src/model/lm_tool_definition.dart';

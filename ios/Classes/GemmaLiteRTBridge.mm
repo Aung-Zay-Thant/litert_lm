@@ -417,13 +417,23 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
     messagesJSON = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
   }
 
+  // Tools JSON
+  NSString *toolsJSON = nil;
+  NSArray *tools = conversationConfig[@"tools"];
+  if ([tools isKindOfClass:[NSArray class]] && tools.count > 0) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:tools options:0 error:nil];
+    toolsJSON = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+  }
+
+  BOOL constrainedDecoding = [conversationConfig[@"constrainedDecoding"] boolValue];
+
   config = _runtime.conversationConfigCreate(
       _engine,
       session,
       systemJSON ? systemJSON.UTF8String : nullptr,
-      nullptr,
+      toolsJSON ? toolsJSON.UTF8String : nullptr,
       messagesJSON ? messagesJSON.UTF8String : nullptr,
-      false);
+      constrainedDecoding);
 
   if (session != nullptr) {
     _runtime.sessionConfigDelete(session);

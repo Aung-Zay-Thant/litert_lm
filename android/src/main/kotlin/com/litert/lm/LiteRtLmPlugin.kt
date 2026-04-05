@@ -326,12 +326,48 @@ class LiteRtLmPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
             }
         }
 
+        // Tools
+        val toolsList = (conversationConfigMap["tools"] as? List<Map<String, Any?>>).orEmpty()
+        val tools = toolsList.mapNotNull { toolDef ->
+            val function = toolDef["function"] as? Map<String, Any?> ?: return@mapNotNull null
+            val name = function["name"] as? String ?: return@mapNotNull null
+            val description = function["description"] as? String ?: ""
+            val params = function["parameters"] as? Map<String, Any?> ?: emptyMap()
+            // Use OpenApiTool for each tool definition
+            object : com.google.ai.edge.litertlm.OpenApiTool {
+                override fun getToolDescriptionJsonString(): String {
+                    val json = org.json.JSONObject()
+                    json.put("name", name)
+                    json.put("description", description)
+                    json.put("parameters", org.json.JSONObject(params))
+                    return json.toString()
+                }
+                override fun execute(paramsJsonString: String): String {
+                    // Tool execution happens on Dart side, not here
+                    return "{\"error\": \"Tool execution should happen on Dart side\"}"
+                }
+            }
+        }
+
+        val constrainedDecoding = conversationConfigMap["constrainedDecoding"] as? Boolean ?: false
+
         val config = ConversationConfig(
             systemInstruction = systemPrompt?.let { Contents.of(it) },
             samplerConfig = samplerConfig,
             initialMessages = initialHistory,
+            tools = tools.map { com.google.ai.edge.litertlm.tool(it) },
+            automaticToolCalling = false,
         )
-        return engine.createConversation(config)
+
+        if (constrainedDecoding) {
+            com.google.ai.edge.litertlm.ExperimentalFlags.enableConversationConstrainedDecoding = true
+        }
+        val conversation = engine.createConversation(config)
+        if (constrainedDecoding) {
+            com.google.ai.edge.litertlm.ExperimentalFlags.enableConversationConstrainedDecoding = false
+        }
+
+        return conversation
     }
 
     private fun buildPromptContents(prompt: List<Map<String, Any?>>): Contents {

@@ -325,7 +325,11 @@ final class MethodChannelLitertLmPlatform implements LitertLmPlatform {
   ) => {
     if (config.systemPrompt != null) 'systemPrompt': config.systemPrompt,
     if (config.initialMessages.isNotEmpty)
-      'initialMessages': config.initialMessages.map(_serializeMessage).toList(),
+      'initialMessages':
+          config.initialMessages.map(_serializeMessage).toList(),
+    if (config.tools.isNotEmpty)
+      'tools': config.tools.map((t) => t.toJson()).toList(),
+    if (config.constrainedDecoding) 'constrainedDecoding': true,
   };
 
   static Map<String, Object?> _serializeMessage(LmMessage message) => {
