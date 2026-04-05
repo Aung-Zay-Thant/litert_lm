@@ -17,6 +17,12 @@ typedef void (^GemmaStreamEventBlock)(NSDictionary *event);
                                     requestId:(NSString *)requestId
                                       onEvent:(GemmaStreamEventBlock)onEvent
                                         error:(NSError **)error;
+- (BOOL)sendToolResponseForConversationId:(NSString *)conversationId
+                                 toolName:(NSString *)toolName
+                               toolResult:(NSString *)toolResult
+                                requestId:(NSString *)requestId
+                                  onEvent:(GemmaStreamEventBlock)onEvent
+                                    error:(NSError **)error;
 - (void)cancelGenerationForConversationId:(NSString *)conversationId;
 - (BOOL)resetConversationWithId:(NSString *)conversationId error:(NSError **)error;
 - (void)disposeConversationWithId:(NSString *)conversationId;

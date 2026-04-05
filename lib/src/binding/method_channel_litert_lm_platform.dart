@@ -142,6 +142,42 @@ final class MethodChannelLitertLmPlatform implements LitertLmPlatform {
   }
 
   @override
+  Stream<String> sendToolResponse({
+    required String engineId,
+    required String conversationId,
+    required String toolName,
+    required String toolResult,
+  }) {
+    final requestId = 'req_${_requestCounter++}';
+    final controller = StreamController<String>();
+    _requests[requestId] = controller;
+
+    controller.onCancel = () {
+      _requests.remove(requestId);
+    };
+
+    scheduleMicrotask(() async {
+      try {
+        await _invoke<void>('conversationSendToolResponse', {
+          'engineId': engineId,
+          'conversationId': conversationId,
+          'requestId': requestId,
+          'toolName': toolName,
+          'toolResult': toolResult,
+        });
+      } catch (error, stackTrace) {
+        _requests.remove(requestId);
+        if (!controller.isClosed) {
+          controller.addError(error, stackTrace);
+          await controller.close();
+        }
+      }
+    });
+
+    return controller.stream;
+  }
+
+  @override
   Future<void> cancelGeneration({
     required String engineId,
     required String conversationId,

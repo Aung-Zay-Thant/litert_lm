@@ -298,6 +298,54 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   return YES;
 }
 
+- (BOOL)sendToolResponseForConversationId:(NSString *)conversationId
+                                 toolName:(NSString *)toolName
+                               toolResult:(NSString *)toolResult
+                                requestId:(NSString *)requestId
+                                  onEvent:(GemmaStreamEventBlock)onEvent
+                                    error:(NSError **)error {
+  LiteRtConversationBox *box = _conversations[conversationId];
+  if (box == nil || box->conversation == nullptr) {
+    [self assignError:error code:@"not_found" message:@"Conversation not found."];
+    return NO;
+  }
+
+  // Build tool response JSON: {"role":"tool","content":[{"type":"tool_response","name":"...","response":"..."}]}
+  NSDictionary *toolResponseMsg = @{
+    @"role": @"tool",
+    @"content": @[@{
+      @"type": @"tool_response",
+      @"name": toolName,
+      @"response": toolResult,
+    }],
+  };
+
+  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:toolResponseMsg options:0 error:nil];
+  if (jsonData == nil) {
+    [self assignError:error code:@"native_failure" message:@"Failed to encode tool response."];
+    return NO;
+  }
+  NSString *messageJSON = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+
+  box->activeRequestId = requestId;
+  StreamContext *ctx = new StreamContext{[onEvent copy], self, box, [requestId copy]};
+  int result = _runtime.conversationSendMessageStream(
+      box->conversation,
+      messageJSON.UTF8String,
+      nullptr,
+      streamCallbackTrampoline,
+      ctx);
+
+  if (result != 0) {
+    box->activeRequestId = nil;
+    delete ctx;
+    [self assignError:error code:@"native_failure" message:@"Failed to send tool response."];
+    return NO;
+  }
+
+  return YES;
+}
+
 - (void)cancelGenerationForConversationId:(NSString *)conversationId {
   LiteRtConversationBox *box = _conversations[conversationId];
   if (box != nil && box->conversation != nullptr) {

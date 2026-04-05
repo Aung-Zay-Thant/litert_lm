@@ -32,6 +32,8 @@ public final class LiteRtLmPlugin: NSObject, FlutterPlugin {
       handleConversationDispose(call, result: result)
     case "conversationGenerate":
       handleConversationGenerate(call, result: result)
+    case "conversationSendToolResponse":
+      handleConversationSendToolResponse(call, result: result)
     case "conversationCancel":
       handleConversationCancel(call, result: result)
     case "conversationReset":
@@ -157,6 +159,29 @@ public final class LiteRtLmPlugin: NSObject, FlutterPlugin {
 
     do {
       try bridge.generateTextStream(forConversationId: conversationId, promptParts: prompt, requestId: requestId) { event in
+        sink(event)
+      }
+      result(nil)
+    } catch {
+      result(flutterError(from: error))
+    }
+  }
+
+  private func handleConversationSendToolResponse(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard
+      let args = call.arguments as? [String: Any],
+      let conversationId = args["conversationId"] as? String,
+      let requestId = args["requestId"] as? String,
+      let toolName = args["toolName"] as? String,
+      let toolResult = args["toolResult"] as? String,
+      let bridge = resolveBridge(call, result: result)
+    else { return }
+    guard let sink = streamEventSink else {
+      result(FlutterError(code: "native_failure", message: "Stream listener not attached.", details: nil))
+      return
+    }
+    do {
+      try bridge.sendToolResponse(forConversationId: conversationId, toolName: toolName, toolResult: toolResult, requestId: requestId) { event in
         sink(event)
       }
       result(nil)

@@ -32,6 +32,13 @@ abstract interface class LitertLmPlatform {
     required List<LmContentPart> prompt,
   });
 
+  Stream<String> sendToolResponse({
+    required String engineId,
+    required String conversationId,
+    required String toolName,
+    required String toolResult,
+  });
+
   Future<void> cancelGeneration({
     required String engineId,
     required String conversationId,

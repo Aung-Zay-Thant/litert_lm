@@ -31,6 +31,22 @@ final class LiteRtLmConversation {
     return generate(prompt: [LmTextPart(text)]);
   }
 
+  /// Send a tool response back to the conversation and stream the model's
+  /// follow-up response. This is the proper way to feed tool results back
+  /// after the model outputs a tool call.
+  Stream<String> sendToolResponse({
+    required String toolName,
+    required String toolResult,
+  }) {
+    _throwIfDisposed();
+    return _platform.sendToolResponse(
+      engineId: _engineId,
+      conversationId: _conversationId,
+      toolName: toolName,
+      toolResult: toolResult,
+    );
+  }
+
   Future<void> cancelGeneration() {
     _throwIfDisposed();
     return _platform.cancelGeneration(
