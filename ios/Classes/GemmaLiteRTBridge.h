@@ -2,23 +2,25 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef void (^GemmaStreamChunkBlock)(NSString *_Nullable chunk, BOOL isFinal, NSString *_Nullable errorMessage);
+typedef void (^GemmaStreamEventBlock)(NSDictionary *event);
 
 @interface GemmaLiteRTBridge : NSObject
 
 - (BOOL)prepareModelAtPath:(NSString *)modelPath
               engineConfig:(nullable NSDictionary *)engineConfig
-        conversationConfig:(nullable NSDictionary *)conversationConfig
                      error:(NSError **)error;
-- (BOOL)generateTextStream:(NSString *)prompt
-                  imagePath:(nullable NSString *)imagePath
-                    onChunk:(GemmaStreamChunkBlock)onChunk
-                      error:(NSError **)error;
-- (void)cancelGeneration;
-- (void)resetConversation;
-- (nullable NSDictionary *)getBenchmarkInfo;
-- (nullable NSString *)extractTextFromResponseJSONString:(NSString *)jsonString
-                                                   error:(NSError **)error;
+- (nullable NSString *)createConversationWithConfig:(nullable NSDictionary *)conversationConfig
+                                      sessionConfig:(nullable NSDictionary *)sessionConfig
+                                              error:(NSError **)error;
+- (BOOL)generateTextStreamForConversationId:(NSString *)conversationId
+                                   promptParts:(NSArray<NSDictionary *> *)promptParts
+                                    requestId:(NSString *)requestId
+                                      onEvent:(GemmaStreamEventBlock)onEvent
+                                        error:(NSError **)error;
+- (void)cancelGenerationForConversationId:(NSString *)conversationId;
+- (BOOL)resetConversationWithId:(NSString *)conversationId error:(NSError **)error;
+- (void)disposeConversationWithId:(NSString *)conversationId;
+- (nullable NSDictionary *)getBenchmarkInfoForConversationId:(NSString *)conversationId;
 
 @end
 

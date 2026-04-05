@@ -1,0 +1,1 @@
+enum LmBackend { cpu, gpu }

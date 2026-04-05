@@ -7,16 +7,29 @@
 
 static NSString *const GemmaLiteRTErrorDomain = @"GemmaLiteRTBridge";
 
+@interface GemmaLiteRTBridge ()
+- (nullable NSString *)extractTextFromResponseJSONString:(NSString *)jsonString;
+@end
+
+@interface LiteRtConversationBox : NSObject {
+ @public
+  LiteRtLmConversation *conversation;
+  NSDictionary *conversationConfig;
+  NSDictionary *sessionConfig;
+  NSString *activeRequestId;
+}
+@end
+
+@implementation LiteRtConversationBox
+@end
+
 namespace {
 
 struct LiteRtRuntime {
   void *constraintProviderHandle = nullptr;
   void *engineHandle = nullptr;
 
-  // Logging
   void (*setMinLogLevel)(int) = nullptr;
-
-  // Engine settings
   LiteRtLmEngineSettings *(*engineSettingsCreate)(const char *, const char *, const char *, const char *) = nullptr;
   void (*engineSettingsDelete)(LiteRtLmEngineSettings *) = nullptr;
   void (*engineSettingsSetMaxNumTokens)(LiteRtLmEngineSettings *, int) = nullptr;
@@ -24,32 +37,21 @@ struct LiteRtRuntime {
   void (*engineSettingsSetActivationDataType)(LiteRtLmEngineSettings *, int) = nullptr;
   void (*engineSettingsSetPrefillChunkSize)(LiteRtLmEngineSettings *, int) = nullptr;
   void (*engineSettingsEnableBenchmark)(LiteRtLmEngineSettings *) = nullptr;
-
-  // Engine lifecycle
   LiteRtLmEngine *(*engineCreate)(const LiteRtLmEngineSettings *) = nullptr;
   void (*engineDelete)(LiteRtLmEngine *) = nullptr;
-
-  // Session config
   LiteRtLmSessionConfig *(*sessionConfigCreate)() = nullptr;
   void (*sessionConfigSetMaxOutputTokens)(LiteRtLmSessionConfig *, int) = nullptr;
   void (*sessionConfigSetSamplerParams)(LiteRtLmSessionConfig *, const LiteRtLmSamplerParams *) = nullptr;
   void (*sessionConfigDelete)(LiteRtLmSessionConfig *) = nullptr;
-
-  // Conversation config + lifecycle
   LiteRtLmConversationConfig *(*conversationConfigCreate)(LiteRtLmEngine *, const LiteRtLmSessionConfig *, const char *, const char *, const char *, bool) = nullptr;
   void (*conversationConfigDelete)(LiteRtLmConversationConfig *) = nullptr;
   LiteRtLmConversation *(*conversationCreate)(LiteRtLmEngine *, LiteRtLmConversationConfig *) = nullptr;
   void (*conversationDelete)(LiteRtLmConversation *) = nullptr;
-
-  // Inference
+  LiteRtLmJsonResponse *(*conversationSendMessage)(LiteRtLmConversation *, const char *, const char *) = nullptr;
   int (*conversationSendMessageStream)(LiteRtLmConversation *, const char *, const char *, LiteRtLmStreamCallback, void *) = nullptr;
   void (*conversationCancelProcess)(LiteRtLmConversation *) = nullptr;
-
-  // Response
   const char *(*jsonResponseGetString)(const LiteRtLmJsonResponse *) = nullptr;
   void (*jsonResponseDelete)(LiteRtLmJsonResponse *) = nullptr;
-
-  // Benchmark
   LiteRtLmBenchmarkInfo *(*conversationGetBenchmarkInfo)(LiteRtLmConversation *) = nullptr;
   void (*benchmarkInfoDelete)(LiteRtLmBenchmarkInfo *) = nullptr;
   double (*benchmarkInfoGetTimeToFirstToken)(const LiteRtLmBenchmarkInfo *) = nullptr;
@@ -61,27 +63,38 @@ struct LiteRtRuntime {
 };
 
 struct StreamContext {
-  GemmaStreamChunkBlock block;
+  GemmaStreamEventBlock block;
   __unsafe_unretained GemmaLiteRTBridge *bridge;
+  __unsafe_unretained LiteRtConversationBox *box;
+  NSString *requestId;
 };
 
 void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFinal, const char *errorMsg) {
   StreamContext *ctx = static_cast<StreamContext *>(callbackData);
   NSString *chunkString = chunk ? [NSString stringWithUTF8String:chunk] : nil;
   NSString *errorString = errorMsg ? [NSString stringWithUTF8String:errorMsg] : nil;
-  BOOL final_ = isFinal ? YES : NO;
 
   dispatch_async(dispatch_get_main_queue(), ^{
-    NSString *plainText = nil;
-    if (chunkString.length > 0) {
-      NSError *parseError = nil;
-      plainText = [ctx->bridge extractTextFromResponseJSONString:chunkString error:&parseError];
-      if (plainText == nil) {
-        plainText = chunkString;
+    NSMutableDictionary *event = [NSMutableDictionary dictionaryWithObject:ctx->requestId forKey:@"requestId"];
+    if (errorString.length > 0) {
+      event[@"type"] = @"error";
+      event[@"code"] = @"native_failure";
+      event[@"message"] = errorString;
+    } else if (isFinal) {
+      event[@"type"] = @"done";
+    } else {
+      NSString *plainText = nil;
+      if (chunkString.length > 0) {
+        plainText = [ctx->bridge extractTextFromResponseJSONString:chunkString];
+      }
+      event[@"type"] = @"chunk";
+      if (plainText.length > 0) {
+        event[@"text"] = plainText;
       }
     }
-    ctx->block(plainText, final_, errorString);
-    if (final_) {
+    ctx->box->activeRequestId = nil;
+    ctx->block(event);
+    if (isFinal || errorString.length > 0) {
       delete ctx;
     }
   });
@@ -92,10 +105,17 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
 @implementation GemmaLiteRTBridge {
   LiteRtRuntime _runtime;
   LiteRtLmEngine *_engine;
-  LiteRtLmConversation *_conversation;
   NSString *_currentModelPath;
-  NSDictionary *_conversationConfig;
   BOOL _benchmarkEnabled;
+  NSMutableDictionary<NSString *, LiteRtConversationBox *> *_conversations;
+}
+
+- (instancetype)init {
+  self = [super init];
+  if (self != nil) {
+    _conversations = [NSMutableDictionary dictionary];
+  }
+  return self;
 }
 
 - (void)dealloc {
@@ -103,26 +123,17 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   [self unloadRuntime];
 }
 
-#pragma mark - Public API
-
 - (BOOL)prepareModelAtPath:(NSString *)modelPath
               engineConfig:(nullable NSDictionary *)engineConfig
-        conversationConfig:(nullable NSDictionary *)conversationConfig
                      error:(NSError **)error {
-  if (_engine != nullptr && [_currentModelPath isEqualToString:modelPath]) {
-    return YES;
-  }
-
-  _conversationConfig = [conversationConfig copy];
-
   struct stat fileInfo;
   if (stat(modelPath.fileSystemRepresentation, &fileInfo) != 0) {
-    [self assignError:error message:[NSString stringWithFormat:@"Model file not found at %@.", modelPath]];
+    [self assignError:error code:@"not_found" message:[NSString stringWithFormat:@"Model file not found at %@.", modelPath]];
     return NO;
   }
 
   if (fileInfo.st_size < (1024ll * 1024ll * 1024ll)) {
-    [self assignError:error message:@"Model file looks incomplete. Delete and re-download."];
+    [self assignError:error code:@"native_failure" message:@"Model file looks incomplete. Delete and re-download."];
     return NO;
   }
 
@@ -137,9 +148,6 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
     return NO;
   }
 
-  _runtime.setMinLogLevel(1);  // WARNING+
-
-  // Parse engine config
   NSString *backend = engineConfig[@"backend"] ?: @"cpu";
   NSString *visionBackend = engineConfig[@"visionBackend"];
   NSString *audioBackend = engineConfig[@"audioBackend"];
@@ -148,20 +156,20 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   NSNumber *prefillChunkSize = engineConfig[@"prefillChunkSize"];
   _benchmarkEnabled = [engineConfig[@"enableBenchmark"] boolValue];
 
+  _runtime.setMinLogLevel(1);
+
   LiteRtLmEngineSettings *settings = _runtime.engineSettingsCreate(
       modelPath.UTF8String,
       backend.UTF8String,
       visionBackend ? visionBackend.UTF8String : nullptr,
       audioBackend ? audioBackend.UTF8String : nullptr);
-
   if (settings == nullptr) {
-    [self assignError:error message:@"Failed to create engine settings."];
+    [self assignError:error code:@"native_failure" message:@"Failed to create engine settings."];
     return NO;
   }
 
   _runtime.engineSettingsSetMaxNumTokens(settings, maxNumTokens);
   _runtime.engineSettingsSetCacheDir(settings, cacheDirectory.fileSystemRepresentation);
-
   if (activationType != nil) {
     _runtime.engineSettingsSetActivationDataType(settings, activationType.intValue);
   }
@@ -176,13 +184,7 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   _runtime.engineSettingsDelete(settings);
 
   if (_engine == nullptr) {
-    [self assignError:error message:@"Failed to create engine."];
-    return NO;
-  }
-
-  _conversation = [self createConversationWithError:error];
-  if (_conversation == nullptr) {
-    [self teardown];
+    [self assignError:error code:@"native_failure" message:@"Failed to create engine."];
     return NO;
   }
 
@@ -190,158 +192,249 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   return YES;
 }
 
-- (BOOL)generateTextStream:(NSString *)prompt
-                  imagePath:(nullable NSString *)imagePath
-                    onChunk:(GemmaStreamChunkBlock)onChunk
-                      error:(NSError **)error {
-  if (_conversation == nullptr) {
-    [self assignError:error message:@"Model is not prepared."];
+- (nullable NSString *)createConversationWithConfig:(nullable NSDictionary *)conversationConfig
+                                      sessionConfig:(nullable NSDictionary *)sessionConfig
+                                              error:(NSError **)error {
+  if (_engine == nullptr) {
+    [self assignError:error code:@"not_prepared" message:@"Engine is not prepared."];
+    return nil;
+  }
+
+  LiteRtLmConversation *conversation = [self createConversationPointerWithConversationConfig:conversationConfig
+                                                                                sessionConfig:sessionConfig
+                                                                                        error:error];
+  if (conversation == nullptr) {
+    return nil;
+  }
+
+  NSString *conversationId = NSUUID.UUID.UUIDString;
+  LiteRtConversationBox *box = [LiteRtConversationBox new];
+  box->conversation = conversation;
+  box->conversationConfig = [conversationConfig copy] ?: @{};
+  box->sessionConfig = [sessionConfig copy] ?: @{};
+  _conversations[conversationId] = box;
+  return conversationId;
+}
+
+- (BOOL)generateTextStreamForConversationId:(NSString *)conversationId
+                                promptParts:(NSArray<NSDictionary *> *)promptParts
+                                  requestId:(NSString *)requestId
+                                    onEvent:(GemmaStreamEventBlock)onEvent
+                                      error:(NSError **)error {
+  LiteRtConversationBox *box = _conversations[conversationId];
+  if (box == nil || box->conversation == nullptr) {
+    [self assignError:error code:@"not_found" message:@"Conversation not found."];
+    return NO;
+  }
+  if (box->activeRequestId != nil) {
+    [self assignError:error code:@"native_failure" message:@"Conversation is already generating."];
     return NO;
   }
 
-  NSString *messageJSON = [self messageJSONStringForPrompt:prompt imagePath:imagePath error:error];
+  NSString *messageJSON = [self messageJSONStringForPromptParts:promptParts error:error];
   if (messageJSON == nil) {
     return NO;
   }
 
-  StreamContext *ctx = new StreamContext{[onChunk copy], self};
-  int result = _runtime.conversationSendMessageStream(
-      _conversation, messageJSON.UTF8String, nullptr, streamCallbackTrampoline, ctx);
+  box->activeRequestId = requestId;
+  GemmaStreamEventBlock eventBlock = [onEvent copy];
+  NSString *requestIdCopy = [requestId copy];
+  NSString *messageJSONCopy = [messageJSON copy];
 
-  if (result != 0) {
-    delete ctx;
-    [self assignError:error message:@"Failed to start streaming."];
-    return NO;
-  }
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    LiteRtLmJsonResponse *response = _runtime.conversationSendMessage(
+        box->conversation,
+        messageJSONCopy.UTF8String,
+        nullptr);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      box->activeRequestId = nil;
+
+    if (response == nullptr) {
+        eventBlock(@{
+          @"requestId": requestIdCopy,
+          @"type": @"error",
+          @"code": @"native_failure",
+          @"message": @"Generation failed.",
+        });
+        return;
+      }
+
+      const char *responseCString = _runtime.jsonResponseGetString(response);
+      NSString *responseJSONString = responseCString == nullptr ? nil : [NSString stringWithUTF8String:responseCString];
+      _runtime.jsonResponseDelete(response);
+
+      NSString *plainText = responseJSONString.length > 0
+          ? [self extractTextFromResponseJSONString:responseJSONString]
+          : @"";
+
+      if (plainText.length > 0) {
+        eventBlock(@{
+          @"requestId": requestIdCopy,
+          @"type": @"chunk",
+          @"text": plainText,
+        });
+      }
+      eventBlock(@{
+        @"requestId": requestIdCopy,
+        @"type": @"done",
+      });
+    });
+  });
 
   return YES;
 }
 
-- (void)cancelGeneration {
-  if (_conversation != nullptr) {
-    _runtime.conversationCancelProcess(_conversation);
+- (void)cancelGenerationForConversationId:(NSString *)conversationId {
+  LiteRtConversationBox *box = _conversations[conversationId];
+  if (box != nil && box->conversation != nullptr) {
+    _runtime.conversationCancelProcess(box->conversation);
   }
 }
 
-- (void)resetConversation {
-  if (_engine == nullptr) return;
-
-  if (_conversation != nullptr) {
-    _runtime.conversationDelete(_conversation);
-    _conversation = nullptr;
+- (BOOL)resetConversationWithId:(NSString *)conversationId error:(NSError **)error {
+  LiteRtConversationBox *box = _conversations[conversationId];
+  if (box == nil || box->conversation == nullptr) {
+    [self assignError:error code:@"not_found" message:@"Conversation not found."];
+    return NO;
   }
-  _conversation = [self createConversationWithError:nil];
+
+  LiteRtLmConversation *replacement = [self createConversationPointerWithConversationConfig:box->conversationConfig
+                                                                               sessionConfig:box->sessionConfig
+                                                                                       error:error];
+  if (replacement == nullptr) {
+    return NO;
+  }
+
+  _runtime.conversationDelete(box->conversation);
+  box->conversation = replacement;
+  box->activeRequestId = nil;
+  return YES;
 }
 
-- (nullable NSDictionary *)getBenchmarkInfo {
-  if (_conversation == nullptr || !_benchmarkEnabled) return nil;
+- (void)disposeConversationWithId:(NSString *)conversationId {
+  LiteRtConversationBox *box = _conversations[conversationId];
+  if (box == nil) {
+    return;
+  }
+  if (box->conversation != nullptr) {
+    _runtime.conversationDelete(box->conversation);
+    box->conversation = nullptr;
+  }
+  [_conversations removeObjectForKey:conversationId];
+}
 
-  LiteRtLmBenchmarkInfo *info = _runtime.conversationGetBenchmarkInfo(_conversation);
-  if (info == nullptr) return nil;
-
-  double ttft = _runtime.benchmarkInfoGetTimeToFirstToken(info);
-  double initTime = _runtime.benchmarkInfoGetTotalInitTime(info);
-
-  double prefillTPS = 0;
-  int numPrefill = _runtime.benchmarkInfoGetNumPrefillTurns(info);
-  if (numPrefill > 0) {
-    prefillTPS = _runtime.benchmarkInfoGetPrefillTokensPerSecAt(info, numPrefill - 1);
+- (nullable NSDictionary *)getBenchmarkInfoForConversationId:(NSString *)conversationId {
+  LiteRtConversationBox *box = _conversations[conversationId];
+  if (box == nil || box->conversation == nullptr || !_benchmarkEnabled) {
+    return nil;
   }
 
-  double decodeTPS = 0;
-  int numDecode = _runtime.benchmarkInfoGetNumDecodeTurns(info);
-  if (numDecode > 0) {
-    decodeTPS = _runtime.benchmarkInfoGetDecodeTokensPerSecAt(info, numDecode - 1);
+  LiteRtLmBenchmarkInfo *info = _runtime.conversationGetBenchmarkInfo(box->conversation);
+  if (info == nullptr) {
+    return nil;
   }
 
-  _runtime.benchmarkInfoDelete(info);
+  double prefillTokensPerSecond = 0;
+  int numPrefillTurns = _runtime.benchmarkInfoGetNumPrefillTurns(info);
+  if (numPrefillTurns > 0) {
+    prefillTokensPerSecond = _runtime.benchmarkInfoGetPrefillTokensPerSecAt(info, numPrefillTurns - 1);
+  }
 
-  return @{
-    @"timeToFirstToken": @(ttft),
-    @"initTime": @(initTime),
-    @"prefillTokensPerSec": @(prefillTPS),
-    @"decodeTokensPerSec": @(decodeTPS),
+  double decodeTokensPerSecond = 0;
+  int numDecodeTurns = _runtime.benchmarkInfoGetNumDecodeTurns(info);
+  if (numDecodeTurns > 0) {
+    decodeTokensPerSecond = _runtime.benchmarkInfoGetDecodeTokensPerSecAt(info, numDecodeTurns - 1);
+  }
+
+  NSDictionary *result = @{
+    @"timeToFirstToken": @(_runtime.benchmarkInfoGetTimeToFirstToken(info)),
+    @"initTime": @(_runtime.benchmarkInfoGetTotalInitTime(info)),
+    @"prefillTokensPerSecond": @(prefillTokensPerSecond),
+    @"decodeTokensPerSecond": @(decodeTokensPerSecond),
   };
+  _runtime.benchmarkInfoDelete(info);
+  return result;
 }
 
-#pragma mark - Private
+- (nullable LiteRtLmConversation *)createConversationPointerWithConversationConfig:(NSDictionary *)conversationConfig
+                                                                      sessionConfig:(NSDictionary *)sessionConfig
+                                                                              error:(NSError **)error {
+  LiteRtLmSessionConfig *session = nullptr;
+  LiteRtLmConversationConfig *config = nullptr;
 
-- (nullable LiteRtLmConversation *)createConversationWithError:(NSError **)error {
-  LiteRtLmSessionConfig *sessionConfig = nullptr;
-  LiteRtLmConversationConfig *convConfig = nullptr;
-
-  NSDictionary *sampler = _conversationConfig[@"sampler"];
-  NSNumber *maxOutputTokens = _conversationConfig[@"maxOutputTokens"];
-
-  // Session config (sampler + max output tokens)
+  NSDictionary *sampler = sessionConfig[@"sampler"];
+  NSNumber *maxOutputTokens = sessionConfig[@"maxOutputTokens"];
   if (sampler != nil || maxOutputTokens != nil) {
-    sessionConfig = _runtime.sessionConfigCreate();
-    if (sessionConfig != nullptr) {
-      if (maxOutputTokens != nil) {
-        _runtime.sessionConfigSetMaxOutputTokens(sessionConfig, maxOutputTokens.intValue);
-      }
-      if (sampler != nil) {
-        LiteRtLmSamplerParams params = {};
-        params.type = kTopP;
-        params.top_k = [sampler[@"topK"] intValue] ?: 40;
-        params.top_p = [sampler[@"topP"] floatValue] ?: 0.95f;
-        params.temperature = [sampler[@"temperature"] floatValue] ?: 0.8f;
-        params.seed = [sampler[@"seed"] intValue] ?: 0;
-        _runtime.sessionConfigSetSamplerParams(sessionConfig, &params);
-      }
+    session = _runtime.sessionConfigCreate();
+    if (session == nullptr) {
+      [self assignError:error code:@"native_failure" message:@"Failed to create session config."];
+      return nullptr;
+    }
+    if (maxOutputTokens != nil) {
+      _runtime.sessionConfigSetMaxOutputTokens(session, maxOutputTokens.intValue);
+    }
+    if (sampler != nil) {
+      LiteRtLmSamplerParams params = {};
+      params.type = kTopP;
+      params.top_k = [sampler[@"topK"] intValue] ?: 40;
+      params.top_p = [sampler[@"topP"] floatValue] ?: 0.95f;
+      params.temperature = [sampler[@"temperature"] floatValue] ?: 0.8f;
+      params.seed = [sampler[@"seed"] intValue] ?: 0;
+      _runtime.sessionConfigSetSamplerParams(session, &params);
     }
   }
 
-  // System prompt
-  NSString *systemPrompt = _conversationConfig[@"systemPrompt"];
   NSString *systemJSON = nil;
+  NSString *messagesJSON = nil;
+  NSString *systemPrompt = conversationConfig[@"systemPrompt"];
+  NSArray *initialMessages = conversationConfig[@"initialMessages"];
+
   if (systemPrompt.length > 0) {
-    NSDictionary *systemMsg = @{
+    NSDictionary *systemMessage = @{
       @"role": @"system",
       @"content": @[@{@"type": @"text", @"text": systemPrompt}],
     };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:systemMsg options:0 error:nil];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:systemMessage options:0 error:nil];
     systemJSON = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
   }
 
-  // Initial messages
-  NSArray *initialMessages = _conversationConfig[@"initialMessages"];
-  NSString *messagesJSON = nil;
   if ([initialMessages isKindOfClass:[NSArray class]] && initialMessages.count > 0) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:initialMessages options:0 error:nil];
     messagesJSON = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
   }
 
-  convConfig = _runtime.conversationConfigCreate(
+  config = _runtime.conversationConfigCreate(
       _engine,
-      sessionConfig,
+      session,
       systemJSON ? systemJSON.UTF8String : nullptr,
-      nullptr,  // tools JSON
+      nullptr,
       messagesJSON ? messagesJSON.UTF8String : nullptr,
-      false);   // constrained decoding
+      false);
 
-  if (sessionConfig != nullptr) {
-    _runtime.sessionConfigDelete(sessionConfig);
+  if (session != nullptr) {
+    _runtime.sessionConfigDelete(session);
   }
 
-  LiteRtLmConversation *conversation = _runtime.conversationCreate(_engine, convConfig);
-
-  if (convConfig != nullptr) {
-    _runtime.conversationConfigDelete(convConfig);
+  LiteRtLmConversation *conversation = _runtime.conversationCreate(_engine, config);
+  if (config != nullptr) {
+    _runtime.conversationConfigDelete(config);
   }
 
   if (conversation == nullptr) {
-    [self assignError:error message:@"Failed to create conversation."];
+    [self assignError:error code:@"native_failure" message:@"Failed to create conversation."];
   }
-
   return conversation;
 }
 
 - (void)teardown {
-  if (_conversation != nullptr) {
-    _runtime.conversationDelete(_conversation);
-    _conversation = nullptr;
+  for (NSString *conversationId in _conversations.allKeys) {
+    LiteRtConversationBox *box = _conversations[conversationId];
+    if (box->conversation != nullptr) {
+      _runtime.conversationDelete(box->conversation);
+      box->conversation = nullptr;
+    }
   }
+  [_conversations removeAllObjects];
   if (_engine != nullptr) {
     _runtime.engineDelete(_engine);
     _engine = nullptr;
@@ -350,7 +443,9 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
 }
 
 - (BOOL)ensureRuntimeLoaded:(NSError **)error {
-  if (_runtime.engineHandle != nullptr) return YES;
+  if (_runtime.engineHandle != nullptr) {
+    return YES;
+  }
 
   NSString *frameworksPath = NSBundle.mainBundle.privateFrameworksPath;
   NSString *constraintProviderPath = [frameworksPath stringByAppendingPathComponent:@"libGemmaModelConstraintProvider.dylib"];
@@ -369,7 +464,6 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
     return NO;
   }
 
-  // Load all symbols
   struct SymbolEntry { void *storage; const char *name; };
   SymbolEntry symbols[] = {
     {&_runtime.setMinLogLevel, "litert_lm_set_min_log_level"},
@@ -390,6 +484,7 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
     {&_runtime.conversationConfigDelete, "litert_lm_conversation_config_delete"},
     {&_runtime.conversationCreate, "litert_lm_conversation_create"},
     {&_runtime.conversationDelete, "litert_lm_conversation_delete"},
+    {&_runtime.conversationSendMessage, "litert_lm_conversation_send_message"},
     {&_runtime.conversationSendMessageStream, "litert_lm_conversation_send_message_stream"},
     {&_runtime.conversationCancelProcess, "litert_lm_conversation_cancel_process"},
     {&_runtime.jsonResponseGetString, "litert_lm_json_response_get_string"},
@@ -404,8 +499,8 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
     {&_runtime.benchmarkInfoGetDecodeTokensPerSecAt, "litert_lm_benchmark_info_get_decode_tokens_per_sec_at"},
   };
 
-  for (const auto &sym : symbols) {
-    if (![self loadSymbol:sym.storage name:sym.name error:error]) {
+  for (const auto &symbol : symbols) {
+    if (![self loadSymbol:symbol.storage name:symbol.name error:error]) {
       [self unloadRuntime];
       return NO;
     }
@@ -417,7 +512,7 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
 - (nullable NSString *)ensureCacheDirectory:(NSError **)error {
   NSURL *cachesDirectory = [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
   if (cachesDirectory == nil) {
-    [self assignError:error message:@"Unable to find caches directory."];
+    [self assignError:error code:@"native_failure" message:@"Unable to find caches directory."];
     return nil;
   }
   NSURL *runtimeDirectory = [cachesDirectory URLByAppendingPathComponent:@"LiteRTLMCache" isDirectory:YES];
@@ -428,8 +523,12 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
 }
 
 - (void)unloadRuntime {
-  if (_runtime.engineHandle != nullptr) dlclose(_runtime.engineHandle);
-  if (_runtime.constraintProviderHandle != nullptr) dlclose(_runtime.constraintProviderHandle);
+  if (_runtime.engineHandle != nullptr) {
+    dlclose(_runtime.engineHandle);
+  }
+  if (_runtime.constraintProviderHandle != nullptr) {
+    dlclose(_runtime.constraintProviderHandle);
+  }
   _runtime = LiteRtRuntime{};
 }
 
@@ -443,57 +542,88 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   return YES;
 }
 
-- (nullable NSString *)messageJSONStringForPrompt:(NSString *)prompt
-                                        imagePath:(nullable NSString *)imagePath
-                                           error:(NSError **)error {
-  NSMutableArray<NSDictionary *> *content = [NSMutableArray arrayWithObject:@{@"type": @"text", @"text": prompt}];
-  if (imagePath.length > 0) {
-    [content addObject:@{@"type": @"image", @"path": imagePath}];
+- (nullable NSString *)messageJSONStringForPromptParts:(NSArray<NSDictionary *> *)promptParts error:(NSError **)error {
+  NSMutableArray<NSDictionary *> *normalizedParts = [NSMutableArray arrayWithCapacity:promptParts.count];
+  for (id rawPart in promptParts) {
+    if (![rawPart isKindOfClass:[NSDictionary class]]) {
+      continue;
+    }
+
+    NSDictionary *part = (NSDictionary *)rawPart;
+    NSString *type = part[@"type"];
+    if ([type isEqualToString:@"image_path"]) {
+      NSString *path = part[@"path"];
+      if (path.length == 0) {
+        [self assignError:error code:@"invalid_argument" message:@"Image prompt part is missing path."];
+        return nil;
+      }
+      [normalizedParts addObject:@{
+        @"type": @"image",
+        @"path": path,
+      }];
+      continue;
+    }
+
+    [normalizedParts addObject:part];
   }
-  NSDictionary *message = @{@"role": @"user", @"content": content};
+
+  NSDictionary *message = @{
+    @"role": @"user",
+    @"content": normalizedParts,
+  };
   NSData *jsonData = [NSJSONSerialization dataWithJSONObject:message options:0 error:error];
   if (jsonData == nil) {
-    [self assignError:error message:@"Failed to encode prompt."];
+    [self assignError:error code:@"invalid_argument" message:@"Failed to encode prompt."];
     return nil;
   }
   return [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
 }
 
-- (nullable NSString *)extractTextFromResponseJSONString:(NSString *)jsonString
-                                                   error:(NSError **)error {
+- (nullable NSString *)extractTextFromResponseJSONString:(NSString *)jsonString {
   NSData *data = [jsonString dataUsingEncoding:NSUTF8StringEncoding];
-  if (data == nil) return jsonString;
-
+  if (data == nil) {
+    return jsonString;
+  }
   id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-  if (![parsed isKindOfClass:[NSDictionary class]]) return jsonString;
-
+  if (![parsed isKindOfClass:[NSDictionary class]]) {
+    return jsonString;
+  }
   NSDictionary *dict = (NSDictionary *)parsed;
   NSMutableArray<NSString *> *parts = [NSMutableArray array];
-
   id content = dict[@"content"];
   if ([content isKindOfClass:[NSString class]]) {
-    if ([(NSString *)content length] > 0) [parts addObject:content];
+    if ([(NSString *)content length] > 0) {
+      [parts addObject:content];
+    }
   } else if ([content isKindOfClass:[NSArray class]]) {
     for (id item in (NSArray *)content) {
-      if (![item isKindOfClass:[NSDictionary class]]) continue;
+      if (![item isKindOfClass:[NSDictionary class]]) {
+        continue;
+      }
       if ([item[@"type"] isEqualToString:@"text"] && [item[@"text"] length] > 0) {
         [parts addObject:item[@"text"]];
       }
     }
   }
-
   return parts.count > 0 ? [parts componentsJoinedByString:@""] : @"";
 }
 
 - (void)assignDlError:(NSError **)error prefix:(NSString *)prefix {
   const char *dlMessage = dlerror();
   NSString *details = dlMessage ? [NSString stringWithUTF8String:dlMessage] : @"Unknown error.";
-  [self assignError:error message:[NSString stringWithFormat:@"%@ %@", prefix, details]];
+  [self assignError:error code:@"native_failure" message:[NSString stringWithFormat:@"%@ %@", prefix, details]];
 }
 
-- (void)assignError:(NSError **)error message:(NSString *)message {
-  if (error == nullptr) return;
-  *error = [NSError errorWithDomain:GemmaLiteRTErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey: message}];
+- (void)assignError:(NSError **)error code:(NSString *)code message:(NSString *)message {
+  if (error == nullptr) {
+    return;
+  }
+  *error = [NSError errorWithDomain:GemmaLiteRTErrorDomain
+                               code:1
+                           userInfo:@{
+                             NSLocalizedDescriptionKey: message,
+                             @"code": code,
+                           }];
 }
 
 @end
