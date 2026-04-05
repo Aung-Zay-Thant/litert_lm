@@ -247,6 +247,12 @@ final class MethodChannelLitertLmPlatform implements LitertLmPlatform {
           controller.add(envelope.text!);
         }
         return;
+      case 'tool_call':
+        // Emit tool call as a special prefixed string so Dart can detect it
+        if (envelope.toolCalls != null) {
+          controller.add('__TOOL_CALL__${envelope.toolCalls}');
+        }
+        return;
       case 'done':
         _requests.remove(envelope.requestId);
         controller.close();
@@ -262,14 +268,7 @@ final class MethodChannelLitertLmPlatform implements LitertLmPlatform {
         controller.close();
         return;
       default:
-        _requests.remove(envelope.requestId);
-        controller.addError(
-          const LitertLmException(
-            code: LitertLmErrorCode.internalError,
-            message: 'Received unknown event type from native layer.',
-          ),
-        );
-        controller.close();
+        // Unknown type — log and ignore instead of erroring
         return;
     }
   }

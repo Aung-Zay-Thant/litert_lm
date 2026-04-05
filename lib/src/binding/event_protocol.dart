@@ -5,6 +5,7 @@ final class EventEnvelope {
     this.text,
     this.code,
     this.message,
+    this.toolCalls,
   });
 
   factory EventEnvelope.fromMap(Map<Object?, Object?> raw) {
@@ -19,6 +20,7 @@ final class EventEnvelope {
       text: raw['text'] as String?,
       code: raw['code'] as String?,
       message: raw['message'] as String?,
+      toolCalls: raw['toolCalls'] as String?,
     );
   }
 
@@ -27,4 +29,7 @@ final class EventEnvelope {
   final String? text;
   final String? code;
   final String? message;
+
+  /// JSON string of tool calls array when type == 'tool_call'
+  final String? toolCalls;
 }

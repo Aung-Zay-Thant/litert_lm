@@ -76,24 +76,59 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
 
   dispatch_async(dispatch_get_main_queue(), ^{
     NSMutableDictionary *event = [NSMutableDictionary dictionaryWithObject:ctx->requestId forKey:@"requestId"];
+
     if (errorString.length > 0) {
+      NSLog(@"[LiteRT-LM] Stream ERROR: %@", errorString);
       event[@"type"] = @"error";
       event[@"code"] = @"native_failure";
       event[@"message"] = errorString;
       ctx->box->activeRequestId = nil;
     } else if (isFinal) {
+      NSLog(@"[LiteRT-LM] Stream DONE for request %@", ctx->requestId);
       event[@"type"] = @"done";
       ctx->box->activeRequestId = nil;
+    } else if (chunkString.length > 0) {
+      NSLog(@"[LiteRT-LM] Stream RAW chunk (%lu chars): %.200s...", (unsigned long)chunkString.length, chunkString.UTF8String);
+
+      // Parse the chunk to detect tool_calls vs content
+      NSData *jsonData = [chunkString dataUsingEncoding:NSUTF8StringEncoding];
+      id parsed = jsonData ? [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil] : nil;
+
+      if ([parsed isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dict = (NSDictionary *)parsed;
+
+        // Check for tool_calls
+        NSArray *toolCalls = dict[@"tool_calls"];
+        if ([toolCalls isKindOfClass:[NSArray class]] && toolCalls.count > 0) {
+          NSLog(@"[LiteRT-LM] TOOL CALL detected: %@", toolCalls);
+          // Send tool_call event to Dart for execution
+          NSData *tcData = [NSJSONSerialization dataWithJSONObject:toolCalls options:0 error:nil];
+          NSString *tcJSON = tcData ? [[NSString alloc] initWithData:tcData encoding:NSUTF8StringEncoding] : @"[]";
+          event[@"type"] = @"tool_call";
+          event[@"toolCalls"] = tcJSON;
+          ctx->block(event);
+          if (isFinal) { delete ctx; }
+          return;
+        }
+
+        // Check for content
+        NSString *plainText = [ctx->bridge extractTextFromResponseJSONString:chunkString];
+        NSLog(@"[LiteRT-LM] Extracted text (%lu chars): %.200s", (unsigned long)plainText.length, plainText.UTF8String);
+        event[@"type"] = @"chunk";
+        if (plainText.length > 0) {
+          event[@"text"] = plainText;
+        }
+      } else {
+        // Not JSON — treat as plain text
+        NSLog(@"[LiteRT-LM] Non-JSON chunk, treating as plain text");
+        event[@"type"] = @"chunk";
+        event[@"text"] = chunkString;
+      }
     } else {
-      NSString *plainText = nil;
-      if (chunkString.length > 0) {
-        plainText = [ctx->bridge extractTextFromResponseJSONString:chunkString];
-      }
+      // Empty chunk
       event[@"type"] = @"chunk";
-      if (plainText.length > 0) {
-        event[@"text"] = plainText;
-      }
     }
+
     ctx->block(event);
     if (isFinal || errorString.length > 0) {
       delete ctx;
@@ -310,7 +345,8 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
     return NO;
   }
 
-  // Build tool response JSON: {"role":"tool","content":[{"type":"tool_response","name":"...","response":"..."}]}
+  // Build tool response JSON — exact same format as Kotlin SDK's handleToolCalls():
+  // {"role":"tool","content":[{"type":"tool_response","name":"X","response":"RESULT"}]}
   NSDictionary *toolResponseMsg = @{
     @"role": @"tool",
     @"content": @[@{
@@ -326,6 +362,7 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
     return NO;
   }
   NSString *messageJSON = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+  NSLog(@"[LiteRT-LM] Sending tool response: %@", messageJSON);
 
   box->activeRequestId = requestId;
   StreamContext *ctx = new StreamContext{[onEvent copy], self, box, [requestId copy]};
@@ -336,11 +373,60 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
       streamCallbackTrampoline,
       ctx);
 
+  NSLog(@"[LiteRT-LM] conversationSendMessageStream for tool response returned: %d", result);
+
   if (result != 0) {
+    NSLog(@"[LiteRT-LM] Streaming tool response failed (code %d), trying blocking fallback", result);
     box->activeRequestId = nil;
     delete ctx;
-    [self assignError:error code:@"native_failure" message:@"Failed to send tool response."];
-    return NO;
+
+    // Try blocking fallback like we do for regular messages
+    GemmaStreamEventBlock eventBlock = [onEvent copy];
+    NSString *requestIdCopy = [requestId copy];
+    NSString *messageJSONCopy = [messageJSON copy];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      LiteRtLmJsonResponse *response = _runtime.conversationSendMessage(
+          box->conversation,
+          messageJSONCopy.UTF8String,
+          nullptr);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        box->activeRequestId = nil;
+
+        if (response == nullptr) {
+          NSLog(@"[LiteRT-LM] Blocking tool response also failed");
+          eventBlock(@{
+            @"requestId": requestIdCopy,
+            @"type": @"error",
+            @"code": @"native_failure",
+            @"message": @"Failed to send tool response via both streaming and blocking.",
+          });
+          return;
+        }
+
+        const char *responseCString = _runtime.jsonResponseGetString(response);
+        NSString *responseJSONString = responseCString ? [NSString stringWithUTF8String:responseCString] : nil;
+        _runtime.jsonResponseDelete(response);
+
+        NSLog(@"[LiteRT-LM] Blocking tool response raw: %.500s", responseJSONString.UTF8String);
+
+        NSString *plainText = responseJSONString.length > 0
+            ? [self extractTextFromResponseJSONString:responseJSONString]
+            : @"";
+
+        if (plainText.length > 0) {
+          eventBlock(@{
+            @"requestId": requestIdCopy,
+            @"type": @"chunk",
+            @"text": plainText,
+          });
+        }
+        eventBlock(@{
+          @"requestId": requestIdCopy,
+          @"type": @"done",
+        });
+      });
+    });
   }
 
   return YES;
@@ -474,6 +560,14 @@ void streamCallbackTrampoline(void *callbackData, const char *chunk, bool isFina
   }
 
   BOOL constrainedDecoding = [conversationConfig[@"constrainedDecoding"] boolValue];
+
+  NSLog(@"[LiteRT-LM] Creating conversation — system:%@, tools:%@, constrained:%d",
+      systemJSON ? @"YES" : @"NO",
+      toolsJSON ? [NSString stringWithFormat:@"YES (%lu chars)", (unsigned long)toolsJSON.length] : @"NO",
+      constrainedDecoding);
+  if (toolsJSON) {
+    NSLog(@"[LiteRT-LM] Tools JSON: %.500s", toolsJSON.UTF8String);
+  }
 
   config = _runtime.conversationConfigCreate(
       _engine,
