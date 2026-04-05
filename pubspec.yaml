@@ -1,0 +1,24 @@
+name: litert_lm
+description: Flutter plugin for on-device LLM inference using LiteRT-LM. Run Gemma 4 and other models locally on iOS and Android.
+version: 0.1.0
+repository: https://github.com/user/litert_lm
+
+environment:
+  sdk: ^3.11.4
+  flutter: ">=3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_secure_storage: ^9.2.4
+  path: ^1.9.1
+  path_provider: ^2.1.5
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.litert.lm
+        pluginClass: LiteRtLmPlugin
+      ios:
+        pluginClass: LiteRtLmPlugin
